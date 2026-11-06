@@ -289,13 +289,19 @@ export function PostEditor({
       toast.success(
         wasPublished
           ? "Changes are live"
-          : result.teaser === "queued_unconfirmed"
-            ? "Published. A public teaser is queued and not confirmed delivered."
-            : result.teaser === "not_configured"
-              ? "Published. Public teaser mirroring is not configured, so nothing was delivered."
-              : result.teaser === "not_queued"
-                ? "Published. The public teaser could not be queued."
-                : "Published",
+          : result.teaser === "accepted"
+            ? "Published. The intake accepted the public teaser. This does not confirm a chat post, and it cannot be recalled from here."
+            : result.teaser === "retryable"
+              ? "Published. The intake did not consume the teaser. The same attempt can be retried only within five minutes."
+              : result.teaser === "needs_review"
+                ? "Published. The intake response was not recognized and was not retried."
+                : result.teaser === "closed"
+                  ? "Published. The intake closed this teaser without a new send."
+                  : result.teaser === "not_configured"
+                    ? "Published. Public teaser mirroring is not configured, so nothing was delivered."
+                    : result.teaser === "not_queued"
+                      ? "Published. The public teaser could not be queued."
+                      : "Published",
       );
       router.refresh();
     } catch {

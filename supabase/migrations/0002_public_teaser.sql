@@ -24,7 +24,7 @@ create table public.distribution_outbox (
   publication_id uuid references public.posts (id) on delete set null,
   type text not null check (type in ('post.published', 'post.unpublished', 'post.access_changed')),
   issued_at text not null unique,
-  status text not null check (status in ('pending', 'sending', 'accepted', 'terminal', 'suppressed')),
+  status text not null check (status in ('pending', 'sending', 'accepted', 'terminal', 'suppressed', 'review')),
   terminal_result text,
   origin text not null default 'transition' check (origin in ('transition', 'catchup')),
   claim_token uuid,

@@ -27,7 +27,7 @@ export function DistributionControls() {
         disabled={pending}
         onClick={() => void run(queueCatchUpTeaser)}
       >
-        Queue the single latest confirmed article
+        Send the one latest confirmed article
       </Button>
       <Button
         type="button"

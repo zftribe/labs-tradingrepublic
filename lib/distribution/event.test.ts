@@ -38,6 +38,7 @@ import {
   signatureHeader,
   slugPatchForSave,
   snapshotFrom,
+  summarizeHandoff,
   teaserRequestForPublish,
   verifySignature,
   type ArticleSnapshot,
@@ -420,7 +421,7 @@ test("a publish send rechecks eligibility and does not call the network when the
     newToken: () => "token-1",
     transport: async () => {
       calls += 1;
-      return { status: 200, body: '{"sent":true}' };
+      return { status: 200, body: '{"ok":true,"sent":true}' };
     },
   });
   assert.equal(calls, 0);
@@ -434,8 +435,8 @@ test("an eligible publish sends one signed body and a duplicate response is not 
   const transport = async (_url: string, body: string, headers: Record<string, string>) => {
     calls.push({ body, signature: headers[SIGNATURE_HEADER] });
     return calls.length === 1
-      ? { status: 200, body: '{"sent":false,"result":"duplicate"}' }
-      : { status: 200, body: '{"sent":true}' };
+      ? { status: 200, body: '{"ok":true,"sent":false,"result":"duplicate"}' }
+      : { status: 200, body: '{"ok":true,"sent":true}' };
   };
   const first = await deliverEvent({
     store,
@@ -464,7 +465,7 @@ test("an eligible publish sends one signed body and a duplicate response is not 
   assert.equal(store.events.get(EVENT)?.status, "terminal");
 });
 
-test("503 not_sent retries the same id and 200 sent true is accepted without a second event", async () => {
+test("503 not sent retries the same id and 200 sent true is accepted without a second event", async () => {
   const store = createMemoryStore({ articles: [article()], events: [publishEvent()] });
   const bodies: string[] = [];
   let attempt = 0;
@@ -472,8 +473,8 @@ test("503 not_sent retries the same id and 200 sent true is accepted without a s
     bodies.push(body);
     attempt += 1;
     return attempt === 1
-      ? { status: 503, body: '{"sent":false,"result":"not_sent"}' }
-      : { status: 200, body: '{"sent":true,"result":"sent"}' };
+      ? { status: 503, body: '{"ok":false,"error":"not sent"}' }
+      : { status: 200, body: '{"ok":true,"sent":true}' };
   };
   const queued = await deliverEvent({
     store,
@@ -502,17 +503,70 @@ test("503 not_sent retries the same id and 200 sent true is accepted without a s
   assert.equal(store.events.get(EVENT)?.status, "accepted");
 });
 
-test("terminal intake results and an unconfirmed ack are not reported as accepted", async () => {
-  for (const result of ["duplicate", "stale", "ignored", "expired", "skipped", "republish", "uncertain"]) {
-    assert.deepEqual(interpretBotResponse(200, `{"sent":false,"result":"${result}"}`, PUBLISH_TYPE, ISSUED, NOW), {
-      action: "terminal",
-      result,
-    });
+test("intake responses use the wire keys and unknown bodies are not retried", async () => {
+  for (const result of ["duplicate", "stale", "ignored", "expired", "skipped", "republish", "uncertain", "revoked"]) {
+    assert.deepEqual(
+      interpretBotResponse(200, `{"ok":true,"sent":false,"result":"${result}"}`, PUBLISH_TYPE, ISSUED, NOW),
+      { action: "terminal", result },
+    );
   }
-  assert.deepEqual(interpretBotResponse(200, '{"sent":true,"result":"uncertain"}', PUBLISH_TYPE, ISSUED, NOW), {
-    action: "terminal",
-    result: "uncertain",
+  assert.deepEqual(
+    interpretBotResponse(200, '{"ok":true,"sent":true,"result":"uncertain"}', PUBLISH_TYPE, ISSUED, NOW),
+    { action: "accepted" },
+  );
+  for (const error of ["not live", "not sent", "recheck failed"]) {
+    assert.deepEqual(
+      interpretBotResponse(503, `{"ok":false,"error":"${error}"}`, PUBLISH_TYPE, ISSUED, NOW),
+      { action: "retry", reason: error.replace(/ /g, "_") },
+    );
+  }
+  assert.deepEqual(
+    interpretBotResponse(503, '{"ok":false,"error":"not_live"}', PUBLISH_TYPE, ISSUED, NOW),
+    { action: "review", reason: "needs_review" },
+  );
+  assert.deepEqual(
+    interpretBotResponse(503, '{"ok":false,"error":"elsewhere"}', UNPUBLISH_TYPE, ISSUED, NOW),
+    { action: "review", reason: "needs_review" },
+  );
+  assert.deepEqual(
+    interpretBotResponse(503, '{"ok":false,"error":"not live"}', PUBLISH_TYPE, ISSUED, NOW + 6 * 60 * 1000),
+    { action: "review", reason: "window_closed" },
+  );
+  assert.deepEqual(summarizeHandoff([{ outcome: "accepted" }]), "accepted");
+  assert.deepEqual(summarizeHandoff([{ outcome: "review", reason: "needs_review" }]), "needs_review");
+  const store = createMemoryStore({ articles: [article()], events: [publishEvent()] });
+  let calls = 0;
+  const first = await deliverEvent({
+    store,
+    eventId: EVENT,
+    config: config(),
+    nowMs: NOW,
+    supabaseUrl: null,
+    newToken: () => "token-1",
+    transport: async () => {
+      calls += 1;
+      return { status: 503, body: '{"ok":false,"error":"not_live"}' };
+    },
   });
+  const second = await deliverEvent({
+    store,
+    eventId: EVENT,
+    config: config(),
+    nowMs: NOW,
+    supabaseUrl: null,
+    newToken: () => "token-2",
+    transport: async () => {
+      calls += 1;
+      return { status: 200, body: '{"ok":true,"sent":true}' };
+    },
+  });
+  assert.equal(first.outcome, "review");
+  assert.equal(second.outcome, "review");
+  assert.equal(calls, 1);
+  assert.equal(store.events.get(EVENT)?.status, "review");
+});
+
+test("a lost accept ack is not reported as accepted", async () => {
   const store = createMemoryStore({ articles: [article()], events: [publishEvent()] });
   store.markAccepted = async () => false;
   const outcome = await deliverEvent({
@@ -522,7 +576,7 @@ test("terminal intake results and an unconfirmed ack are not reported as accepte
     nowMs: NOW,
     supabaseUrl: null,
     newToken: () => "token-1",
-    transport: async () => ({ status: 200, body: '{"sent":true}' }),
+    transport: async () => ({ status: 200, body: '{"ok":true,"sent":true}' }),
   });
   assert.equal(outcome.outcome, "unconfirmed");
   assert.notEqual(store.events.get(EVENT)?.status, "accepted");
@@ -555,7 +609,7 @@ test("network failure leaves the event queued and a missing config does not call
     newToken: () => "token-1",
     transport: async () => {
       calls += 1;
-      return { status: 200, body: '{"sent":true}' };
+      return { status: 200, body: '{"ok":true,"sent":true}' };
     },
   });
   assert.equal(calls, 0);
@@ -587,7 +641,7 @@ test("a pending revocation is delivered before a pending publish", async () => {
     newToken: () => "token-p",
     transport: async (_url, body) => {
       sent.push(JSON.parse(body).type);
-      return { status: 200, body: '{"sent":true}' };
+      return { status: 200, body: '{"ok":true,"sent":true}' };
     },
   });
   assert.equal(deferred.outcome, "deferred");
@@ -603,7 +657,7 @@ test("a pending revocation is delivered before a pending publish", async () => {
     newToken: () => "token-r",
     transport: async (_url, body) => {
       sent.push(JSON.parse(body).type);
-      return { status: 200, body: '{"sent":true}' };
+      return { status: 200, body: '{"ok":true,"sent":true}' };
     },
   });
   assert.equal(revocation.outcome, "accepted");
@@ -633,10 +687,10 @@ test("concurrent claims allow one send", async () => {
         nowMs: NOW,
         supabaseUrl: null,
         newToken: () => "token-2",
-        transport: async () => ({ status: 200, body: '{"sent":true}' }),
+        transport: async () => ({ status: 200, body: '{"ok":true,"sent":true}' }),
       });
       await gate;
-      return { status: 200, body: '{"sent":true}' };
+      return { status: 200, body: '{"ok":true,"sent":true}' };
     },
   });
   await new Promise((resolve) => setTimeout(resolve, 10));
@@ -669,7 +723,7 @@ test("stale recheck after claim suppresses the publish before the request", asyn
     newToken: () => "token-1",
     transport: async () => {
       calls += 1;
-      return { status: 200, body: '{"sent":true}' };
+      return { status: 200, body: '{"ok":true,"sent":true}' };
     },
   });
   assert.equal(calls, 0);
@@ -793,4 +847,10 @@ test("migration defaults to unknown and the recheck route is uncached", () => {
   assert.doesNotMatch(runtime, /127\.0\.0\.1/);
   assert.doesNotMatch(runtime, /DISCORD_BOT_TOKEN/);
   assert.doesNotMatch(runtime, /content_html/);
+  assert.doesNotMatch(runtime, /from "next\/server"/);
+  const publish = readFileSync(join(root, "app/dashboard/actions.ts"), "utf8");
+  assert.match(publish, /await handoffPublication\(id\)/);
+  assert.doesNotMatch(publish, /schedulePublicationHandoff|after\(/);
+  const admin = readFileSync(join(root, "app/admin/actions.ts"), "utf8");
+  assert.match(admin, /handoffPublication\(result\.publicationId\)/);
 });

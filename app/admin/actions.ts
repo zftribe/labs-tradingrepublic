@@ -4,12 +4,12 @@ import { revalidatePath } from "next/cache";
 import { createAdminClient } from "@/utils/supabase/admin";
 import { requireAdmin } from "@/lib/auth";
 import { PREVIEW } from "@/lib/preview";
-import { readMirrorConfig } from "@/lib/distribution/event";
+import { readMirrorConfig, summarizeHandoff } from "@/lib/distribution/event";
 import {
   distributionColumnReady,
+  handoffPublication,
   retryQueued,
   runCatchUp,
-  schedulePublicationHandoff,
 } from "@/lib/distribution/runtime";
 
 const siteUrl =
@@ -130,7 +130,13 @@ export async function adminUnpublishPost(formData: FormData) {
     .update({ status: "draft" })
     .eq("id", id);
   if (error) throw new Error(error.message);
-  if (await distributionColumnReady(admin)) schedulePublicationHandoff(id);
+  if (await distributionColumnReady(admin)) {
+    try {
+      await handoffPublication(id);
+    } catch {
+      // The unpublish stands. A revocation stays queued.
+    }
+  }
 
   revalidatePath("/");
   if (post) revalidatePath(`/posts/${post.slug}`);
@@ -152,11 +158,8 @@ export async function queueCatchUpTeaser(): Promise<ActionResult> {
     if (!result.ok) {
       return { ok: false, message: catchUpMessage(result.reason) };
     }
-    return {
-      ok: true,
-      message:
-        "One article was queued. It was not sent. Retry within five minutes of queuing, and only after the route is verified live.",
-    };
+    const teaser = summarizeHandoff(await handoffPublication(result.publicationId));
+    return { ok: teaser === "accepted" || teaser === "retryable", message: catchUpSent(teaser) };
   } catch {
     return { ok: false, message: "Catch-up could not be queued. Nothing was sent." };
   }
@@ -176,14 +179,35 @@ export async function retryQueuedTeasers(): Promise<ActionResult> {
     }
     const accepted = result.outcomes.filter((item) => item.outcome === "accepted").length;
     const queued = result.outcomes.filter((item) => item.outcome === "queued").length;
-    const terminal = result.outcomes.filter((item) => item.outcome === "terminal").length;
+    const review = result.outcomes.filter((item) => item.outcome === "review").length;
     return {
       ok: true,
-      message: `Intake accepted ${accepted}. Still queued ${queued}. Terminal ${terminal}. This does not confirm a chat post, and an accepted teaser cannot be recalled.`,
+      message: `Intake accepted ${accepted}. Still retryable inside five minutes ${queued}. Held for review ${review}. Items held for review were not sent again. This does not confirm a chat post.`,
     };
   } catch {
     return { ok: false, message: "Retry failed before any handoff was confirmed." };
   }
+}
+
+function catchUpSent(
+  teaser: "accepted" | "needs_review" | "retryable" | "not_configured" | "closed" | "not_queued",
+): string {
+  if (teaser === "accepted") {
+    return "The one latest confirmed article was handed to the intake. This does not confirm a chat post, and it cannot be recalled. The same post is not sent again.";
+  }
+  if (teaser === "retryable") {
+    return "The one latest confirmed article was sent once and not consumed. The same attempt can be retried only within five minutes. No older article was selected.";
+  }
+  if (teaser === "needs_review") {
+    return "The intake response was not recognized. It was not retried. No older article was selected.";
+  }
+  if (teaser === "not_configured") {
+    return "Mirroring is not configured, so the one article was not sent.";
+  }
+  if (teaser === "closed") {
+    return "The intake closed this one article without a new send. No older article was selected.";
+  }
+  return "The one article was not sent.";
 }
 
 function catchUpMessage(reason: string): string {

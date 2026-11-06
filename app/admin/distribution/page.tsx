@@ -16,15 +16,16 @@ export default function DistributionPage() {
         </p>
         <p>
           Delivery configured: {config.enabled ? "yes" : "no"}. Catch-up flag:{" "}
-          {config.catchupEnabled ? "on" : "off"}. A publish handoff must leave
-          within five minutes of its database timestamp. Revocation handoffs can
-          be retried later. Nothing on this page confirms a chat post, and a
-          teaser that was already handed off cannot be recalled.
+          {config.catchupEnabled ? "on" : "off"}. Publishing an author-confirmed
+          public article attempts the handoff in that request. This page does
+          not send every article. Retry is only for an unconsumed attempt still
+          inside five minutes. A response that was not recognized is held and is
+          not sent again. Nothing here confirms a chat post, and a teaser that
+          was already handed off cannot be recalled.
         </p>
         <p>
-          Catch-up selects only the newest author-confirmed public article, queues
-          one row, and does not send it. Use it once, after the route is verified
-          live, then retry within five minutes.
+          The catch-up button selects the newest author-confirmed public article
+          and attempts that one handoff. It does not select an older article.
         </p>
       </div>
       <DistributionControls />

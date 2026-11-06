@@ -101,8 +101,8 @@ This repository does not apply the database change, deploy, or send anything.
    `https://<this-site>/api/distribution/eligibility` with an https scheme and
    no user, password, query, fragment, or trailing slash. The bot calls
    `<that base>/<post id>`.
-5. Leave `LABS_MIRROR_CATCHUP_ENABLED` unset. After the route is verified live
-   separately, set it to `true`, queue the single latest confirmed article from
-   `/admin/distribution`, and retry within five minutes. That path queues one
-   row and does not send a backlog. A teaser that was already handed off cannot
-   be recalled.
+5. Leave `LABS_MIRROR_CATCHUP_ENABLED` unset. After the route is verified live,
+   set it to `true` and use `/admin/distribution` once. That selects the newest
+   author-confirmed public article and attempts its handoff. It does not send a
+   backlog and it is the only catch-up. A teaser that was already handed off
+   cannot be recalled.

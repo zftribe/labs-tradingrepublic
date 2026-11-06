@@ -53,17 +53,30 @@ the current status and access. They are created only when a publish attempt may
 already have been accepted or is in flight. A pending publish that has not
 started is suppressed instead.
 
-The intake's five-minute freshness window applies to `post.published`
-(`issued_at` no older than five minutes and no more than 60 seconds in the
-future). Revocations are still sent after five minutes. Two different event ids
-with the same `issued_at` are not retried after a `409`.
+A normal publish of an author-confirmed public article attempts delivery inside
+that same server action. The outbox is the record of that attempt. The admin
+retry control is recovery for a not-consumed response, not the way every
+article is sent. There is no scheduler. On a serverless host the attempt lives
+only as long as that invocation: if the platform freezes or kills the function
+before the intake responds, the row stays pending and can be retried only while
+`issued_at` is still inside five minutes. Nothing in this app polls or retries
+later by itself.
 
-HTTP `200` with `sent: false` and result `duplicate`, `stale`, `ignored`,
-`expired`, `skipped`, `republish`, or `uncertain` is terminal. `sent: true`
-with result `uncertain` is also terminal and needs a human check. `503` with
-`not_live` or `not_sent` leaves a publish retryable only inside the five-minute
-window. A revocation `503` is not consumed and stays retryable. This process
-does not poll.
+The intake's five-minute freshness window applies to a new `post.published`
+event (`issued_at` no older than five minutes and no more than 60 seconds in
+the future). A revocation may be sent after five minutes. A retry of an
+unconsumed `503` uses the same event id and only while that timestamp is still
+inside five minutes.
+
+HTTP `200` with `ok: true` and `sent: true` is accepted and is not retried.
+HTTP `200` with `ok: true`, `sent: false`, and `result` of `duplicate`, `stale`,
+`ignored`, `expired`, `skipped`, `republish`, `uncertain`, or `revoked` is
+terminal and is not retried. HTTP `503` with `ok: false` and `error` of
+`not live`, `not sent`, or `recheck failed` (spaces, not underscores) was not
+consumed. The same event id may be retried only inside five minutes. Any other
+status or body is held for review and is not sent again. Stored notes use
+`not_live`, `not_sent`, and `recheck_failed` only as names for those three
+wire values.
 
 ## Current-row recheck
 
@@ -114,13 +127,19 @@ message. There is no delete or edit of a message that was already posted.
 
 Publish events are not replayed after the five-minute window. An article
 published while delivery is off, or while the intake is down longer than that,
-is not handed off later except by the single owner catch-up below. Edits and
+is not handed off later except by the single catch-up below. Edits and
 republishes do not create a second publish once one was accepted or terminally
-recorded as a duplicate, republish, or uncertain result.
+recorded as a duplicate, republish, revoked, or uncertain result. `revoked`
+closes that event; it does not by itself block a later draft-to-published
+transition. `distribution_access` classifies redistribution consent. It does
+not enforce payment or membership.
 
 ## Catch-up
 
-`/admin/distribution` can queue the newest author-confirmed public article when
-`LABS_MIRROR_CATCHUP_ENABLED` is exactly `true`. It does not select an older
-article if that one is already recorded, and it does not send. An admin retry
-within five minutes is what attempts delivery. The flag ships unset.
+There is one catch-up. When `LABS_MIRROR_CATCHUP_ENABLED` is exactly `true`,
+`/admin/distribution` selects the newest author-confirmed public article and
+attempts that one handoff immediately. It does not select an older article, and
+it does not ask anyone to run a second catch-up elsewhere. The intake dedupes
+by post id and its own destination, so the same post is not posted twice. The
+flag ships unset. If that single attempt is an unconsumed `503`, the same event
+id can be retried from this page only while it is still inside five minutes.

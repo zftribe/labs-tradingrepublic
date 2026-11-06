@@ -41,7 +41,11 @@ export const TERMINAL_RESULTS = [
   "skipped",
   "republish",
   "uncertain",
+  "revoked",
 ] as const;
+
+/** Wire `error` strings on an unconsumed HTTP 503. Spaces are significant. */
+export const RETRYABLE_503_ERRORS = ["not live", "not sent", "recheck failed"] as const;
 
 /** Terminal intake results that mean a later publish must not be issued. */
 export const BLOCKING_TERMINAL = new Set<string>([
@@ -90,7 +94,7 @@ export interface OutboxEvent {
   postId: string;
   type: EventType;
   issuedAt: string;
-  status: "pending" | "sending" | "accepted" | "terminal" | "suppressed";
+  status: "pending" | "sending" | "accepted" | "terminal" | "suppressed" | "review";
   terminalResult: string | null;
   origin: "transition" | "catchup";
   claimToken: string | null;
@@ -511,72 +515,57 @@ export function planDatabaseTransition(
 export type Interpret =
   | { action: "accepted" }
   | { action: "terminal"; result: string }
-  | { action: "retry"; reason: string };
+  | { action: "retry"; reason: string }
+  | { action: "review"; reason: string };
 
-function resultCode(rawBody: string): string | null {
-  try {
-    const parsed = JSON.parse(rawBody) as { result?: unknown };
-    if (!parsed || typeof parsed !== "object" || typeof parsed.result !== "string") {
-      return null;
-    }
-    return parsed.result.trim().toLowerCase().replace(/\s+/g, "_");
-  } catch {
-    return null;
-  }
+function wireText(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const text = value.trim().toLowerCase().replace(/\s+/g, " ");
+  return text || null;
+}
+
+function internalCode(wire: string): string {
+  return wire.replace(/ /g, "_");
 }
 
 export function interpretBotResponse(
   status: number,
   rawBody: string,
-  eventType: EventType,
+  _eventType: EventType,
   issuedAt: string,
   nowMs: number,
 ): Interpret {
-  const publishExpired =
-    eventType === PUBLISH_TYPE && publishFreshness(issuedAt, nowMs) === "expired";
-  if (status === 200) {
-    let sent: unknown;
-    let result = "";
-    try {
-      const parsed = JSON.parse(rawBody) as { sent?: unknown; result?: unknown };
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        return { action: "terminal", result: "uncertain" };
-      }
-      sent = parsed.sent;
-      if (typeof parsed.result === "string") {
-        result = parsed.result.trim().toLowerCase().replace(/\s+/g, "_");
-      }
-    } catch {
-      return { action: "terminal", result: "uncertain" };
+  const fresh = publishFreshness(issuedAt, nowMs) === "fresh";
+  let parsed: { ok?: unknown; sent?: unknown; result?: unknown; error?: unknown } | null =
+    null;
+  try {
+    const value = JSON.parse(rawBody) as unknown;
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      parsed = value as { ok?: unknown; sent?: unknown; result?: unknown; error?: unknown };
     }
-    if (sent === true && result === "uncertain") {
-      return { action: "terminal", result: "uncertain" };
+  } catch {
+    parsed = null;
+  }
+  if (!parsed) return { action: "review", reason: "needs_review" };
+
+  if (status === 200 && parsed.ok === true && parsed.sent === true) {
+    return { action: "accepted" };
+  }
+  if (status === 200 && parsed.ok === true && parsed.sent === false) {
+    const result = wireText(parsed.result);
+    if (result && (TERMINAL_RESULTS as readonly string[]).includes(result)) {
+      return { action: "terminal", result: internalCode(result) };
     }
-    if (sent === true) return { action: "accepted" };
-    if (sent === false && (TERMINAL_RESULTS as readonly string[]).includes(result)) {
-      return { action: "terminal", result };
-    }
-    return { action: "terminal", result: "uncertain" };
   }
   if (status === 409) return { action: "terminal", result: "issued_at_conflict" };
-  if (status >= 300 && status < 400) return { action: "terminal", result: "rejected" };
-  if (status === 503) {
-    const result = resultCode(rawBody) ?? "not_live";
-    if (result === "not_sent") {
-      if (publishExpired) return { action: "terminal", result: "expired" };
-      return { action: "retry", reason: "not_sent" };
+  if (status === 503 && parsed.ok === false) {
+    const error = wireText(parsed.error);
+    if (error && (RETRYABLE_503_ERRORS as readonly string[]).includes(error)) {
+      if (fresh) return { action: "retry", reason: internalCode(error) };
+      return { action: "review", reason: "window_closed" };
     }
-    if (publishExpired || (eventType === PUBLISH_TYPE && publishFreshness(issuedAt, nowMs) !== "fresh")) {
-      return { action: "terminal", result: "expired" };
-    }
-    return { action: "retry", reason: "not_live" };
   }
-  if (status === 429 || status === 502 || status === 504 || status >= 500) {
-    if (publishExpired) return { action: "terminal", result: "expired" };
-    return { action: "retry", reason: `http_${status}` };
-  }
-  if (status >= 400) return { action: "terminal", result: "rejected" };
-  return { action: "terminal", result: "rejected" };
+  return { action: "review", reason: "needs_review" };
 }
 
 export interface DeliveryStore {
@@ -596,6 +585,7 @@ export interface DeliveryStore {
   expirePending(id: string): Promise<boolean>;
   suppressPendingPublish(postId: string): Promise<void>;
   suppressPending(id: string, result: string): Promise<boolean>;
+  markReview(id: string, token: string, result: string): Promise<boolean>;
 }
 
 export interface DeliveryOutcome {
@@ -606,6 +596,7 @@ export interface DeliveryOutcome {
     | "suppressed"
     | "deferred"
     | "queued"
+    | "review"
     | "unconfirmed";
   reason?: string;
   result?: string;
@@ -627,6 +618,18 @@ function materialize(
     slug: event.snapshot.slug,
     coverImageUrl: event.snapshot.coverImageUrl,
   };
+}
+
+export function summarizeHandoff(
+  outcomes: { outcome: string; reason?: string }[],
+): "accepted" | "needs_review" | "retryable" | "not_configured" | "closed" | "not_queued" {
+  if (outcomes.some((item) => item.outcome === "accepted")) return "accepted";
+  if (outcomes.some((item) => item.outcome === "review")) return "needs_review";
+  if (outcomes.some((item) => item.reason === "unconfigured")) return "not_configured";
+  if (outcomes.some((item) => item.outcome === "terminal")) return "closed";
+  if (outcomes.some((item) => item.outcome === "queued")) return "retryable";
+  if (outcomes.length === 0) return "not_queued";
+  return "retryable";
 }
 
 export function deliveryOrder(events: OutboxEvent[]): OutboxEvent[] {
@@ -656,6 +659,7 @@ export async function deliverEvent(args: {
   const event = await args.store.getEvent(args.eventId);
   if (!event) return { outcome: "missing" };
   if (event.status === "accepted") return { outcome: "accepted" };
+  if (event.status === "review") return { outcome: "review", reason: event.terminalResult ?? "needs_review" };
   if (event.status === "terminal" || event.status === "suppressed") {
     return { outcome: "terminal", result: event.terminalResult ?? undefined };
   }
@@ -760,10 +764,16 @@ export async function deliverEvent(args: {
       [SIGNATURE_HEADER]: signatureHeader(args.config.secret!, built.event.canonical),
     });
   } catch {
-    const marked = await args.store.markPending(claimed.id, token, "network");
+    if (publishFreshness(claimed.issuedAt, args.nowMs) === "fresh") {
+      const marked = await args.store.markPending(claimed.id, token, "network");
+      return marked
+        ? { outcome: "queued", reason: "network" }
+        : { outcome: "unconfirmed", reason: "network" };
+    }
+    const marked = await args.store.markReview(claimed.id, token, "needs_review");
     return marked
-      ? { outcome: "queued", reason: "network" }
-      : { outcome: "unconfirmed", reason: "network" };
+      ? { outcome: "review", reason: "needs_review" }
+      : { outcome: "unconfirmed", reason: "needs_review" };
   }
 
   const decision = interpretBotResponse(
@@ -784,6 +794,12 @@ export async function deliverEvent(args: {
     return marked
       ? { outcome: "terminal", result: decision.result }
       : { outcome: "unconfirmed", reason: decision.result };
+  }
+  if (decision.action === "review") {
+    const marked = await args.store.markReview(claimed.id, token, decision.reason);
+    return marked
+      ? { outcome: "review", reason: decision.reason }
+      : { outcome: "unconfirmed", reason: decision.reason };
   }
   const marked = await args.store.markPending(claimed.id, token, decision.reason);
   return marked
@@ -1008,6 +1024,14 @@ export function createMemoryStore(seed?: {
       if (!event || event.status !== "pending") return false;
       event.status = "suppressed";
       event.terminalResult = result;
+      return true;
+    },
+    async markReview(id, token, result) {
+      const event = events.get(id);
+      if (!event || event.status !== "sending" || event.claimToken !== token) return false;
+      event.status = "review";
+      event.terminalResult = result;
+      event.claimToken = null;
       return true;
     },
     async catchupExists() {

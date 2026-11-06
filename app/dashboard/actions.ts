@@ -13,14 +13,14 @@ import {
   canClassifyPost,
   frozenPublishedAt,
   parseDistributionAccess,
-  readMirrorConfig,
   slugPatchForSave,
+  summarizeHandoff,
   teaserRequestForPublish,
 } from "@/lib/distribution/event";
 import {
   distributionColumnReady,
+  handoffPublication,
   hasPendingPublish,
-  schedulePublicationHandoff,
 } from "@/lib/distribution/runtime";
 
 // Slug uniqueness is global (posts.slug has a UNIQUE constraint), but a normal
@@ -116,7 +116,13 @@ export async function savePost(
     .eq("id", id);
 
   if (error) throw new Error(error.message);
-  if (ready) schedulePublicationHandoff(id);
+  if (ready) {
+    try {
+      await handoffPublication(id);
+    } catch {
+      // The article save stands. A pending teaser stays in the outbox.
+    }
+  }
   return { slug };
 }
 
@@ -165,7 +171,10 @@ export async function setPostTags(postId: string, tagNames: string[]) {
 
 export type PublishTeaserState =
   | "not_requested"
-  | "queued_unconfirmed"
+  | "accepted"
+  | "retryable"
+  | "needs_review"
+  | "closed"
   | "not_configured"
   | "not_queued";
 
@@ -220,21 +229,22 @@ export async function publishPost(
   revalidatePath("/dashboard");
 
   if (!requested) {
-    if (ready) schedulePublicationHandoff(id);
+    if (ready) {
+      try {
+        await handoffPublication(id);
+      } catch {
+        // Publication stands. Any revocation stays queued.
+      }
+    }
     return { teaser: "not_requested" };
   }
   if (!ready) return { teaser: "not_queued" };
   try {
     const pending = await hasPendingPublish(id);
-    if (pending) schedulePublicationHandoff(id);
     if (!pending) return { teaser: "not_queued" };
-    return {
-      teaser: readMirrorConfig(process.env).enabled
-        ? "queued_unconfirmed"
-        : "not_configured",
-    };
+    return { teaser: summarizeHandoff(await handoffPublication(id)) };
   } catch {
-    return { teaser: "not_queued" };
+    return { teaser: "retryable" };
   }
 }
 
@@ -253,7 +263,13 @@ export async function unpublishPost(id: string) {
     .update({ status: "draft" })
     .eq("id", id);
   if (error) throw new Error(error.message);
-  if (await distributionColumnReady(supabase)) schedulePublicationHandoff(id);
+  if (await distributionColumnReady(supabase)) {
+    try {
+      await handoffPublication(id);
+    } catch {
+      // The draft change stands. A revocation stays queued.
+    }
+  }
 
   revalidatePath("/");
   if (post) revalidatePath(`/posts/${post.slug}`);
@@ -272,7 +288,13 @@ export async function deletePost(id: string) {
 
   const { error } = await supabase.from("posts").delete().eq("id", id);
   if (error) throw new Error(error.message);
-  if (await distributionColumnReady(supabase)) schedulePublicationHandoff(id);
+  if (await distributionColumnReady(supabase)) {
+    try {
+      await handoffPublication(id);
+    } catch {
+      // The delete stands. A revocation stays queued.
+    }
+  }
 
   revalidatePath("/");
   if (post?.status === "published") revalidatePath(`/posts/${post.slug}`);

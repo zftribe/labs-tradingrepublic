@@ -1,6 +1,5 @@
 import "server-only";
 
-import { after } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { createAdminClient } from "@/utils/supabase/admin";
 import type { Database } from "@/lib/database.types";
@@ -238,6 +237,16 @@ function createStore(): DeliveryStore & CatchUpStore {
         .select("id");
       return !error && (data?.length ?? 0) > 0;
     },
+    async markReview(id, token, result) {
+      const { data, error } = await admin()
+        .from("distribution_outbox")
+        .update({ status: "review", terminal_result: result, claim_token: null, last_error: result })
+        .eq("id", id)
+        .eq("status", "sending")
+        .eq("claim_token", token)
+        .select("id");
+      return !error && (data?.length ?? 0) > 0;
+    },
     async catchupExists() {
       const { data, error } = await admin()
         .from("distribution_outbox")
@@ -316,20 +325,18 @@ export async function deliverOutboxEvent(eventId: string): Promise<DeliveryOutco
   });
 }
 
-export async function handoffPublication(postId: string): Promise<void> {
+export async function handoffPublication(postId: string): Promise<DeliveryOutcome[]> {
   try {
     const store = createStore();
     const pending = await store.listPendingForPost(postId);
+    const outcomes: DeliveryOutcome[] = [];
     for (const event of deliveryOrder(pending)) {
-      await deliverOutboxEvent(event.id);
+      outcomes.push(await deliverOutboxEvent(event.id));
     }
+    return outcomes;
   } catch {
-    // The outbox row remains. Payloads are not logged.
+    return [{ outcome: "unconfirmed", reason: "handoff_failed" }];
   }
-}
-
-export function schedulePublicationHandoff(postId: string) {
-  after(() => handoffPublication(postId));
 }
 
 export async function hasPendingPublish(postId: string): Promise<boolean> {
