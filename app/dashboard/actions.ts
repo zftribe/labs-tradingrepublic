@@ -8,7 +8,20 @@ import { requireUser } from "@/lib/auth";
 import { slugify } from "@/lib/slug";
 import { renderPostHtml } from "@/lib/sanitize";
 import { PREVIEW } from "@/lib/preview";
-import type { Json } from "@/lib/database.types";
+import type { DistributionAccess, Json } from "@/lib/database.types";
+import {
+  canClassifyPost,
+  frozenPublishedAt,
+  parseDistributionAccess,
+  slugPatchForSave,
+  summarizeHandoff,
+  teaserRequestForPublish,
+} from "@/lib/distribution/event";
+import {
+  distributionColumnReady,
+  handoffPublication,
+  hasPendingPublish,
+} from "@/lib/distribution/runtime";
 
 // Slug uniqueness is global (posts.slug has a UNIQUE constraint), but a normal
 // RLS-scoped client can't see other authors' drafts, so two authors would both
@@ -61,21 +74,32 @@ export async function savePost(
     excerpt: string | null;
     cover_image_url: string | null;
     content_json: Json;
+    distribution_access?: DistributionAccess;
   },
 ) {
-  await requireUser();
+  const profile = await requireUser();
   const supabase = await createClient();
+  const access = parseAccess(input.distribution_access);
+
+  const ready = await distributionColumnReady(supabase);
+  const current = ready
+    ? (
+        await supabase
+          .from("posts")
+          .select("status, author_id, distribution_access")
+          .eq("id", id)
+          .single()
+      ).data
+    : (
+        await supabase.from("posts").select("status, author_id").eq("id", id).single()
+      ).data;
+  if (!current) throw new Error("Post not found");
+  if (!canClassifyPost(profile, current.author_id)) throw new Error("Forbidden");
 
   // Keep the slug in sync with the title while still a draft; freeze it once
   // published so shared links never break.
-  const { data: current } = await supabase
-    .from("posts")
-    .select("status")
-    .eq("id", id)
-    .single();
-
   const slug =
-    current?.status === "draft"
+    slugPatchForSave(current.status) === "refresh"
       ? await uniqueSlug(input.title || "untitled", id)
       : undefined;
 
@@ -87,11 +111,26 @@ export async function savePost(
       cover_image_url: input.cover_image_url,
       content_json: input.content_json,
       ...(slug ? { slug } : {}),
+      ...(ready && access ? { distribution_access: access } : {}),
     })
     .eq("id", id);
 
   if (error) throw new Error(error.message);
+  if (ready) {
+    try {
+      await handoffPublication(id);
+    } catch {
+      // The article save stands. A pending teaser stays in the outbox.
+    }
+  }
   return { slug };
+}
+
+function parseAccess(value: DistributionAccess | undefined): DistributionAccess | undefined {
+  if (value === undefined) return undefined;
+  const parsed = parseDistributionAccess(value);
+  if (!parsed) throw new Error("Invalid redistribution choice");
+  return parsed;
 }
 
 export async function setPostTags(postId: string, tagNames: string[]) {
@@ -130,32 +169,83 @@ export async function setPostTags(postId: string, tagNames: string[]) {
   }
 }
 
-export async function publishPost(id: string) {
-  await requireUser();
-  const supabase = await createClient();
+export type PublishTeaserState =
+  | "not_requested"
+  | "accepted"
+  | "retryable"
+  | "needs_review"
+  | "closed"
+  | "not_configured"
+  | "not_queued";
 
-  const { data: post, error: fetchErr } = await supabase
-    .from("posts")
-    .select("slug, content_json, published_at")
-    .eq("id", id)
-    .single();
-  if (fetchErr || !post) throw new Error(fetchErr?.message ?? "Post not found");
+export async function publishPost(
+  id: string,
+  input?: { distribution_access?: DistributionAccess },
+): Promise<{ teaser: PublishTeaserState }> {
+  const profile = await requireUser();
+  const supabase = await createClient();
+  const access = parseAccess(input?.distribution_access);
+  const ready = await distributionColumnReady(supabase);
+
+  const fetched = ready
+    ? await supabase
+        .from("posts")
+        .select("slug, content_json, published_at, author_id, status, distribution_access")
+        .eq("id", id)
+        .single()
+    : await supabase
+        .from("posts")
+        .select("slug, content_json, published_at, author_id, status")
+        .eq("id", id)
+        .single();
+  const post = fetched.data;
+  if (fetched.error || !post) throw new Error(fetched.error?.message ?? "Post not found");
+  if (!canClassifyPost(profile, post.author_id)) throw new Error("Forbidden");
 
   const html = renderPostHtml(post.content_json);
+  const publishedAt = frozenPublishedAt(post.published_at, new Date().toISOString());
+  const storedAccess =
+    "distribution_access" in post
+      ? (post.distribution_access as DistributionAccess | null | undefined)
+      : undefined;
+  const requested = teaserRequestForPublish(post.status, access ?? storedAccess);
 
-  const { error } = await supabase
+  const { data: updated, error } = await supabase
     .from("posts")
     .update({
       status: "published",
       content_html: html,
-      published_at: post.published_at ?? new Date().toISOString(),
+      published_at: publishedAt,
+      ...(ready && access ? { distribution_access: access } : {}),
     })
-    .eq("id", id);
+    .eq("id", id)
+    .select("id")
+    .maybeSingle();
   if (error) throw new Error(error.message);
+  if (!updated) throw new Error("Post not found");
 
   revalidatePath("/");
   revalidatePath(`/posts/${post.slug}`);
   revalidatePath("/dashboard");
+
+  if (!requested) {
+    if (ready) {
+      try {
+        await handoffPublication(id);
+      } catch {
+        // Publication stands. Any revocation stays queued.
+      }
+    }
+    return { teaser: "not_requested" };
+  }
+  if (!ready) return { teaser: "not_queued" };
+  try {
+    const pending = await hasPendingPublish(id);
+    if (!pending) return { teaser: "not_queued" };
+    return { teaser: summarizeHandoff(await handoffPublication(id)) };
+  } catch {
+    return { teaser: "retryable" };
+  }
 }
 
 export async function unpublishPost(id: string) {
@@ -173,6 +263,13 @@ export async function unpublishPost(id: string) {
     .update({ status: "draft" })
     .eq("id", id);
   if (error) throw new Error(error.message);
+  if (await distributionColumnReady(supabase)) {
+    try {
+      await handoffPublication(id);
+    } catch {
+      // The draft change stands. A revocation stays queued.
+    }
+  }
 
   revalidatePath("/");
   if (post) revalidatePath(`/posts/${post.slug}`);
@@ -191,6 +288,13 @@ export async function deletePost(id: string) {
 
   const { error } = await supabase.from("posts").delete().eq("id", id);
   if (error) throw new Error(error.message);
+  if (await distributionColumnReady(supabase)) {
+    try {
+      await handoffPublication(id);
+    } catch {
+      // The delete stands. A revocation stays queued.
+    }
+  }
 
   revalidatePath("/");
   if (post?.status === "published") revalidatePath(`/posts/${post.slug}`);

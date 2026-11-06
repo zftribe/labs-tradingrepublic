@@ -11,6 +11,7 @@ export type Json =
 
 export type UserRole = "admin" | "author";
 export type PostStatus = "draft" | "published";
+export type DistributionAccess = "unknown" | "public" | "withheld";
 
 export interface Database {
   public: {
@@ -57,6 +58,7 @@ export interface Database {
           content_html: string | null;
           status: PostStatus;
           published_at: string | null;
+          distribution_access?: DistributionAccess;
           created_at: string;
           updated_at: string;
         };
@@ -71,6 +73,7 @@ export interface Database {
           content_html?: string | null;
           status?: PostStatus;
           published_at?: string | null;
+          distribution_access?: DistributionAccess;
           created_at?: string;
           updated_at?: string;
         };
@@ -85,6 +88,79 @@ export interface Database {
           content_html?: string | null;
           status?: PostStatus;
           published_at?: string | null;
+          distribution_access?: DistributionAccess;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Relationships: [];
+      };
+      distribution_outbox: {
+        Row: {
+          id: string;
+          post_id: string;
+          publication_id: string | null;
+          type: string;
+          issued_at: string;
+          status: string;
+          terminal_result: string | null;
+          origin: string;
+          claim_token: string | null;
+          claimed_at: string | null;
+          attempt_count: number;
+          last_error: string | null;
+          snapshot_status: string;
+          snapshot_access: string;
+          snapshot_published_at: string | null;
+          snapshot_title: string;
+          snapshot_slug: string;
+          snapshot_excerpt: string | null;
+          snapshot_cover: string | null;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id: string;
+          post_id: string;
+          publication_id?: string | null;
+          type: string;
+          issued_at: string;
+          status?: string;
+          terminal_result?: string | null;
+          origin?: string;
+          claim_token?: string | null;
+          claimed_at?: string | null;
+          attempt_count?: number;
+          last_error?: string | null;
+          snapshot_status: string;
+          snapshot_access: string;
+          snapshot_published_at?: string | null;
+          snapshot_title: string;
+          snapshot_slug: string;
+          snapshot_excerpt?: string | null;
+          snapshot_cover?: string | null;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: {
+          id?: string;
+          post_id?: string;
+          publication_id?: string | null;
+          type?: string;
+          issued_at?: string;
+          status?: string;
+          terminal_result?: string | null;
+          origin?: string;
+          claim_token?: string | null;
+          claimed_at?: string | null;
+          attempt_count?: number;
+          last_error?: string | null;
+          snapshot_status?: string;
+          snapshot_access?: string;
+          snapshot_published_at?: string | null;
+          snapshot_title?: string;
+          snapshot_slug?: string;
+          snapshot_excerpt?: string | null;
+          snapshot_cover?: string | null;
           created_at?: string;
           updated_at?: string;
         };
@@ -106,6 +182,11 @@ export interface Database {
     Views: Record<string, never>;
     Functions: {
       is_admin: { Args: Record<string, never>; Returns: boolean };
+      next_teaser_issued_at: { Args: Record<string, never>; Returns: string };
+      distribution_eligibility: {
+        Args: { p_id: string };
+        Returns: { status: string; access: string; issued_at: string }[];
+      };
     };
     Enums: {
       user_role: UserRole;

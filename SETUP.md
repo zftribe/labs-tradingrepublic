@@ -77,3 +77,32 @@ Open http://localhost:3000. Sign in at `/login`; author tools live at
 
 After DNS propagates, sign in, invite an author, and publish a test post to
 confirm auth, invites, and OG previews work on the live domain.
+
+## 7. Public teaser handoff (optional, off until you enable it)
+
+Published articles are already public on the site. There is no membership or
+paywall. A separate author control, default **Not classified**, decides whether
+a short public teaser may be handed to the downstream research bot the first
+time a draft is published. Existing articles stay unclassified. See
+[docs/public-teaser-event.md](docs/public-teaser-event.md).
+
+This repository does not apply the database change, deploy, or send anything.
+
+1. Review [`supabase/migrations/0002_public_teaser.sql`](supabase/migrations/0002_public_teaser.sql)
+   and run it yourself in the SQL editor only after that review. It defaults
+   every article to `unknown`.
+2. Set `FM_LABS_EVENT_SECRET` in this host's server environment and the same
+   value on the bot host. Generate it yourself. Do not put the chat bot token
+   on this host.
+3. Set `LABS_MIRROR_URL` to the https origin of the intake you approve. The
+   website posts to `/v1/labs-events` on that origin. No intake address is
+   stored in git.
+4. On the bot host, set `FM_LABS_RECHECK_URL` to
+   `https://<this-site>/api/distribution/eligibility` with an https scheme and
+   no user, password, query, fragment, or trailing slash. The bot calls
+   `<that base>/<post id>`.
+5. Leave `LABS_MIRROR_CATCHUP_ENABLED` unset. After the route is verified live,
+   set it to `true` and use `/admin/distribution` once. That selects the newest
+   author-confirmed public article and attempts its handoff. It does not send a
+   backlog and it is the only catch-up. A teaser that was already handed off
+   cannot be recalled.

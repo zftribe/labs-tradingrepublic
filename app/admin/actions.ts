@@ -3,6 +3,14 @@
 import { revalidatePath } from "next/cache";
 import { createAdminClient } from "@/utils/supabase/admin";
 import { requireAdmin } from "@/lib/auth";
+import { PREVIEW } from "@/lib/preview";
+import { readMirrorConfig, summarizeHandoff } from "@/lib/distribution/event";
+import {
+  distributionColumnReady,
+  handoffPublication,
+  retryQueued,
+  runCatchUp,
+} from "@/lib/distribution/runtime";
 
 const siteUrl =
   process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000";
@@ -122,8 +130,96 @@ export async function adminUnpublishPost(formData: FormData) {
     .update({ status: "draft" })
     .eq("id", id);
   if (error) throw new Error(error.message);
+  if (await distributionColumnReady(admin)) {
+    try {
+      await handoffPublication(id);
+    } catch {
+      // The unpublish stands. A revocation stays queued.
+    }
+  }
 
   revalidatePath("/");
   if (post) revalidatePath(`/posts/${post.slug}`);
   revalidatePath("/admin/posts");
+}
+
+export async function queueCatchUpTeaser(): Promise<ActionResult> {
+  const me = await requireAdmin();
+  if (PREVIEW) return { ok: false, message: "Unavailable in preview." };
+  if (me.role !== "admin") return { ok: false, message: "Forbidden." };
+  if (!readMirrorConfig(process.env).catchupEnabled) {
+    return {
+      ok: false,
+      message: "Catch-up is off. Nothing was selected or sent.",
+    };
+  }
+  try {
+    const result = await runCatchUp(me.role);
+    if (!result.ok) {
+      return { ok: false, message: catchUpMessage(result.reason) };
+    }
+    const teaser = summarizeHandoff(await handoffPublication(result.publicationId));
+    return { ok: teaser === "accepted" || teaser === "retryable", message: catchUpSent(teaser) };
+  } catch {
+    return { ok: false, message: "Catch-up could not be queued. Nothing was sent." };
+  }
+}
+
+export async function retryQueuedTeasers(): Promise<ActionResult> {
+  const me = await requireAdmin();
+  if (PREVIEW) return { ok: false, message: "Unavailable in preview." };
+  if (me.role !== "admin") return { ok: false, message: "Forbidden." };
+  try {
+    const result = await retryQueued(me.role);
+    if (!result.ok) {
+      if (result.reason === "unconfigured") {
+        return { ok: false, message: "Mirroring is not configured. Nothing was sent." };
+      }
+      return { ok: false, message: "Queued handoffs could not be read. Nothing was sent." };
+    }
+    const accepted = result.outcomes.filter((item) => item.outcome === "accepted").length;
+    const queued = result.outcomes.filter((item) => item.outcome === "queued").length;
+    const review = result.outcomes.filter((item) => item.outcome === "review").length;
+    return {
+      ok: true,
+      message: `Intake accepted ${accepted}. Still retryable inside five minutes ${queued}. Held for review ${review}. Items held for review were not sent again. This does not confirm a chat post.`,
+    };
+  } catch {
+    return { ok: false, message: "Retry failed before any handoff was confirmed." };
+  }
+}
+
+function catchUpSent(
+  teaser: "accepted" | "needs_review" | "retryable" | "not_configured" | "closed" | "not_queued",
+): string {
+  if (teaser === "accepted") {
+    return "The one latest confirmed article was handed to the intake. This does not confirm a chat post, and it cannot be recalled. The same post is not sent again.";
+  }
+  if (teaser === "retryable") {
+    return "The one latest confirmed article was sent once and not consumed. The same attempt can be retried only within five minutes. No older article was selected.";
+  }
+  if (teaser === "needs_review") {
+    return "The intake response was not recognized. It was not retried. No older article was selected.";
+  }
+  if (teaser === "not_configured") {
+    return "Mirroring is not configured, so the one article was not sent.";
+  }
+  if (teaser === "closed") {
+    return "The intake closed this one article without a new send. No older article was selected.";
+  }
+  return "The one article was not sent.";
+}
+
+function catchUpMessage(reason: string): string {
+  if (reason === "unauthorized") return "Forbidden.";
+  if (reason === "disabled") return "Catch-up is off. Nothing was selected or sent.";
+  if (reason === "catchup_already_used") return "The one catch-up was already used. Nothing was sent.";
+  if (reason === "already_mirrored") {
+    return "The latest confirmed article was already handed off. No older article was selected.";
+  }
+  if (reason === "already_recorded") {
+    return "The latest confirmed article already has a teaser record. Nothing new was queued.";
+  }
+  if (reason === "none") return "No confirmed public article is available. Nothing was selected.";
+  return "Catch-up did not queue an article. Nothing was sent.";
 }
