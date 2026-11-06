@@ -15,7 +15,7 @@ import {
   unpublishPost,
   deletePost,
 } from "@/app/dashboard/actions";
-import type { Post } from "@/lib/database.types";
+import type { DistributionAccess, Post } from "@/lib/database.types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -26,15 +26,24 @@ import { CoverCropDialog } from "./cover-crop-dialog";
 
 type SaveState = "idle" | "saving" | "saved";
 
+function readAccess(post: Post): DistributionAccess {
+  if (post.distribution_access === "public" || post.distribution_access === "withheld") {
+    return post.distribution_access;
+  }
+  return "unknown";
+}
+
 export function PostEditor({
   post,
   authorId,
   initialTags,
+  distributionAvailable = false,
   preview = false,
 }: {
   post: Post;
   authorId: string;
   initialTags: string[];
+  distributionAvailable?: boolean;
   preview?: boolean;
 }) {
   const router = useRouter();
@@ -58,6 +67,9 @@ export function PostEditor({
     { src: null, key: 0 },
   );
   const [tagsValue, setTagsValue] = useState(initialTags.join(", "));
+  const initialDistribution = readAccess(post);
+  const distributionAccess = useRef<DistributionAccess>(initialDistribution);
+  const [distributionChoice, setDistributionChoice] = useState(initialDistribution);
 
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Live editor ref so the paste/drop handlers (captured once by editorProps)
@@ -122,6 +134,9 @@ export function PostEditor({
         // action serialization drops null-prototype objects, silently losing
         // every media node's src. Round-trip to plain objects first.
         content_json: JSON.parse(JSON.stringify(editor.getJSON())),
+        ...(distributionAvailable
+          ? { distribution_access: distributionAccess.current }
+          : {}),
       });
       setSaveState("saved");
       return true;
@@ -130,7 +145,7 @@ export function PostEditor({
       toast.error("Couldn't save changes");
       return false;
     }
-  }, [editor, post.id, preview]);
+  }, [distributionAvailable, editor, post.id, preview]);
 
   const scheduleSave = useCallback(() => {
     setSaveState("saving");
@@ -264,9 +279,24 @@ export function PostEditor({
         return;
       }
       await saveTags();
-      await publishPost(post.id);
+      const result = await publishPost(
+        post.id,
+        distributionAvailable
+          ? { distribution_access: distributionAccess.current }
+          : undefined,
+      );
       setStatus("published");
-      toast.success(wasPublished ? "Changes are live" : "Published");
+      toast.success(
+        wasPublished
+          ? "Changes are live"
+          : result.teaser === "queued_unconfirmed"
+            ? "Published. A public teaser is queued and not confirmed delivered."
+            : result.teaser === "not_configured"
+              ? "Published. Public teaser mirroring is not configured, so nothing was delivered."
+              : result.teaser === "not_queued"
+                ? "Published. The public teaser could not be queued."
+                : "Published",
+      );
       router.refresh();
     } catch {
       toast.error("Couldn't publish");
@@ -457,6 +487,35 @@ export function PostEditor({
             rows={2}
           />
         </div>
+        {distributionAvailable && (
+          <div className="grid gap-2">
+            <Label htmlFor="distribution-access">Public teaser</Label>
+            <select
+              id="distribution-access"
+              className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+              value={distributionChoice}
+              onChange={(e) => {
+                const value = e.target.value as DistributionAccess;
+                distributionAccess.current = value;
+                setDistributionChoice(value);
+                scheduleSave();
+              }}
+            >
+              <option value="unknown">Not classified — do not mirror</option>
+              <option value="public">Allow a public teaser when this draft is published</option>
+              <option value="withheld">Do not redistribute</option>
+            </select>
+            <p className="text-xs text-muted-foreground">
+              This site has no membership or paywall. Publishing already makes
+              an article public here. This choice only controls whether a short
+              public teaser may be handed to the downstream research bot the
+              first time this draft is published. It does not create paid or
+              members-only access. Unclassified articles are not mirrored.
+              Changing this after publication does not send a new teaser, and a
+              teaser that was already handed off cannot be recalled from here.
+            </p>
+          </div>
+        )}
         <div className="grid gap-2">
           <Label htmlFor="tags">Tags</Label>
           <Input

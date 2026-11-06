@@ -3,6 +3,14 @@
 import { revalidatePath } from "next/cache";
 import { createAdminClient } from "@/utils/supabase/admin";
 import { requireAdmin } from "@/lib/auth";
+import { PREVIEW } from "@/lib/preview";
+import { readMirrorConfig } from "@/lib/distribution/event";
+import {
+  distributionColumnReady,
+  retryQueued,
+  runCatchUp,
+  schedulePublicationHandoff,
+} from "@/lib/distribution/runtime";
 
 const siteUrl =
   process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000";
@@ -122,8 +130,72 @@ export async function adminUnpublishPost(formData: FormData) {
     .update({ status: "draft" })
     .eq("id", id);
   if (error) throw new Error(error.message);
+  if (await distributionColumnReady(admin)) schedulePublicationHandoff(id);
 
   revalidatePath("/");
   if (post) revalidatePath(`/posts/${post.slug}`);
   revalidatePath("/admin/posts");
+}
+
+export async function queueCatchUpTeaser(): Promise<ActionResult> {
+  const me = await requireAdmin();
+  if (PREVIEW) return { ok: false, message: "Unavailable in preview." };
+  if (me.role !== "admin") return { ok: false, message: "Forbidden." };
+  if (!readMirrorConfig(process.env).catchupEnabled) {
+    return {
+      ok: false,
+      message: "Catch-up is off. Nothing was selected or sent.",
+    };
+  }
+  try {
+    const result = await runCatchUp(me.role);
+    if (!result.ok) {
+      return { ok: false, message: catchUpMessage(result.reason) };
+    }
+    return {
+      ok: true,
+      message:
+        "One article was queued. It was not sent. Retry within five minutes of queuing, and only after the route is verified live.",
+    };
+  } catch {
+    return { ok: false, message: "Catch-up could not be queued. Nothing was sent." };
+  }
+}
+
+export async function retryQueuedTeasers(): Promise<ActionResult> {
+  const me = await requireAdmin();
+  if (PREVIEW) return { ok: false, message: "Unavailable in preview." };
+  if (me.role !== "admin") return { ok: false, message: "Forbidden." };
+  try {
+    const result = await retryQueued(me.role);
+    if (!result.ok) {
+      if (result.reason === "unconfigured") {
+        return { ok: false, message: "Mirroring is not configured. Nothing was sent." };
+      }
+      return { ok: false, message: "Queued handoffs could not be read. Nothing was sent." };
+    }
+    const accepted = result.outcomes.filter((item) => item.outcome === "accepted").length;
+    const queued = result.outcomes.filter((item) => item.outcome === "queued").length;
+    const terminal = result.outcomes.filter((item) => item.outcome === "terminal").length;
+    return {
+      ok: true,
+      message: `Intake accepted ${accepted}. Still queued ${queued}. Terminal ${terminal}. This does not confirm a chat post, and an accepted teaser cannot be recalled.`,
+    };
+  } catch {
+    return { ok: false, message: "Retry failed before any handoff was confirmed." };
+  }
+}
+
+function catchUpMessage(reason: string): string {
+  if (reason === "unauthorized") return "Forbidden.";
+  if (reason === "disabled") return "Catch-up is off. Nothing was selected or sent.";
+  if (reason === "catchup_already_used") return "The one catch-up was already used. Nothing was sent.";
+  if (reason === "already_mirrored") {
+    return "The latest confirmed article was already handed off. No older article was selected.";
+  }
+  if (reason === "already_recorded") {
+    return "The latest confirmed article already has a teaser record. Nothing new was queued.";
+  }
+  if (reason === "none") return "No confirmed public article is available. Nothing was selected.";
+  return "Catch-up did not queue an article. Nothing was sent.";
 }

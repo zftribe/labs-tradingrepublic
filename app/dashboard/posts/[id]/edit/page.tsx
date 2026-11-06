@@ -18,7 +18,13 @@ export default async function EditPostPage({
     const post = previewPostById(id);
     if (!post) notFound();
     return (
-      <PostEditor post={post} authorId={profile.id} initialTags={[]} preview />
+      <PostEditor
+        post={post}
+        authorId={profile.id}
+        initialTags={[]}
+        distributionAvailable={"distribution_access" in post}
+        preview
+      />
     );
   }
 
@@ -47,5 +53,12 @@ export default async function EditPostPage({
     tags = (t ?? []).map((r) => r.name);
   }
 
-  return <PostEditor post={post} authorId={profile.id} initialTags={tags} />;
+  return (
+    <PostEditor
+      post={post}
+      authorId={profile.id}
+      initialTags={tags}
+      distributionAvailable={"distribution_access" in post}
+    />
+  );
 }
